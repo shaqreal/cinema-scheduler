@@ -1,0 +1,7 @@
+# Runtime deps (only needed if running from source with Python)
+pandas>=2.0
+openpyxl>=3.1
+python-dateutil>=2.8
+
+# Build deps (only needed if you are packaging executables yourself)
+# pyinstaller>=6.0
