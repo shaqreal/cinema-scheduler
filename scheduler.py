@@ -235,6 +235,15 @@ INLINE_FINAL_RED = InlineFont(color="FFFF0000", b=True)
 # Screen unit columns (auto-detected from bookings DataFrame)
 SCREEN_UNIT_COLS: List[str] = []
 
+# Columns that represent 3D (e.g., "3D", "Digital 3D", "3-D") should be treated as part of the
+# standard/digital screen pool, not as their own premium format.
+_THREE_D_COL_RE = re.compile(r"(?i)(^|[^a-z0-9])3\s*[- ]?\s*d($|[^a-z0-9])")
+
+def is_3d_unit_col(col_name: object) -> bool:
+    """Return True if a unit column name represents a 3D screen count."""
+    return bool(_THREE_D_COL_RE.search(str(col_name).strip()))
+
+
 
 # The first detected unit column is treated as the "standard/digital" room pool for that export.
 # Remaining detected unit columns are treated as separate premium room pools, appended in order.
@@ -733,6 +742,7 @@ def load_bookings(path: str, sheet_name: str = BOOKINGS_SHEET_NAME) -> pd.DataFr
         df["Circuit"] = df["Circuit"].astype(str).str.strip().str.replace(r'\s+', ' ', regex=True).str.rstrip(', ')
     if "Theatre Name" in df.columns:
         df["Theatre Name"] = df["Theatre Name"].astype(str).str.strip().str.replace(r'\s+', ' ', regex=True).str.rstrip(', ')
+        df["Theatre Name"] = df["Theatre Name"].apply(strip_amenity_suffix)
     if "City" in df.columns:
         df["City"] = df["City"].astype(str).str.strip().str.replace(r'\s+', ' ', regex=True).str.rstrip(', ')
     if "ST" in df.columns:
@@ -2556,6 +2566,7 @@ def normalize_sheet_key(name: str) -> str:
     
     # Lowercase
     key = name.lower()
+    key = strip_amenity_suffix(key)
     
     # Remove suffix like " (2)", " (3)" at end
     key = re.sub(r'\s*\(\d+\)\s*$', '', key)
@@ -2572,6 +2583,39 @@ def normalize_sheet_key(name: str) -> str:
     key = key.rstrip(' ,')
     
     return key
+
+# ---------------------------------------------------------------------------
+# Theater-name normalization helpers (Epic / amenity suffixes like '+ IMAX, 4D, XL')
+# ---------------------------------------------------------------------------
+
+# Tokens that indicate the text after '+' or 'with' is an amenity/format list, not part of the base name.
+_FORMAT_TOKENS_PATTERN = r"\b(?:imax|4d|3d|2d|xl|epicxl|xts|lux|atmos|dolby|dolby\s+cinema|rpx|screenx|mx4d|d-?box|dbox|vip|plf)\b"
+
+def strip_amenity_suffix(name: str) -> str:
+    """
+    Strip amenity/format suffixes from a theater/sheet name when they look like:
+      - '<Base> + IMAX, 4D, XL ...'
+      - '<Base> with EPIC XL ...'
+    Only strips if the suffix contains known format tokens (IMAX, 4D, XL, XTS, LUX, etc.).
+    """
+    s = str(name or "").strip()
+    if not s:
+        return s
+    # Normalize whitespace first
+    s = re.sub(r"\s+", " ", s).strip()
+
+    # If there's a '+' and the right side contains known format tokens, keep only the left side.
+    m = re.search(r"\s\+\s(.+)$", s)
+    if m and re.search(_FORMAT_TOKENS_PATTERN, m.group(1), flags=re.IGNORECASE):
+        s = s[: m.start()].rstrip(" ,")
+
+    # If there's a ' with ' and the right side contains known format tokens, keep only the left side.
+    m2 = re.search(r"\swith\s(.+)$", s, flags=re.IGNORECASE)
+    if m2 and re.search(_FORMAT_TOKENS_PATTERN, m2.group(1), flags=re.IGNORECASE):
+        s = s[: m2.start()].rstrip(" ,")
+
+    return s
+
 
 
 def normalize_theatre_name(theater_name: str, prefix_regex: Optional[re.Pattern] = None) -> str:
@@ -2599,6 +2643,7 @@ def normalize_theatre_name(theater_name: str, prefix_regex: Optional[re.Pattern]
     s = re.sub(r"\s+", " ", s)
     # Remove trailing commas/spaces
     s = s.rstrip(" ,")
+    s = strip_amenity_suffix(s)
     return s
 
 
@@ -3550,14 +3595,30 @@ def run_scheduler_update(
     print(f"[INFO] Loaded {len(bookings_df)} booking rows from '{bookings_path}'.")
     
     # Auto-detect screen unit columns from the bookings DataFrame
+    # Treat any "3D" unit columns as standard capacity: fold them into the standard/digital unit column.
     global SCREEN_UNIT_COLS
-    SCREEN_UNIT_COLS = detect_screen_unit_cols(bookings_df)
-    print(f"[INFO] Detected screen unit columns: {SCREEN_UNIT_COLS}")
+    raw_unit_cols = detect_screen_unit_cols(bookings_df)
+    three_d_cols = [c for c in raw_unit_cols if is_3d_unit_col(c)]
+    SCREEN_UNIT_COLS = [c for c in raw_unit_cols if c not in three_d_cols]
+    print(f"[INFO] Detected screen unit columns (raw): {raw_unit_cols}")
 
-    # Establish "standard" (first unit col) and premium cols (remaining), in file order
+    # Establish "standard" (first NON-3D unit col) and premium cols (remaining), in file order
     global STANDARD_UNIT_COL, PREMIUM_UNIT_COLS
     STANDARD_UNIT_COL = SCREEN_UNIT_COLS[0] if SCREEN_UNIT_COLS else ""
     PREMIUM_UNIT_COLS = SCREEN_UNIT_COLS[1:] if len(SCREEN_UNIT_COLS) > 1 else []
+
+    # Fold 3D counts into the standard/digital column so 3D is treated as standard capacity.
+    if three_d_cols and STANDARD_UNIT_COL:
+        for c in three_d_cols:
+            if c in bookings_df.columns:
+                bookings_df[STANDARD_UNIT_COL] = (
+                    pd.to_numeric(bookings_df[STANDARD_UNIT_COL], errors="coerce").fillna(0)
+                    + pd.to_numeric(bookings_df[c], errors="coerce").fillna(0)
+                )
+
+    if three_d_cols:
+        print(f"[INFO] Treating 3D columns as standard and folding into '{STANDARD_UNIT_COL}': {three_d_cols}")
+    print(f"[INFO] Screen unit columns (used): {SCREEN_UNIT_COLS}")
 
     # Coerce detected unit columns to numeric now that we know what they are
     for col in SCREEN_UNIT_COLS:
