@@ -1,11 +1,8 @@
 # Cinema Scheduler (Windows)
 
-This folder contains **two executables**:
+This folder contains **one executable**:
 
-- `scheduler_ui.exe` — the point-and-click app (recommended)
-- `scheduler.exe` — the command-line version (optional)
-
-Both do the same scheduling update; the UI just makes it easier to choose files.
+- `scheduler_ui.exe`
 
 ---
 
@@ -40,18 +37,6 @@ An Excel file (`.xlsx` / `.xlsm`) with one sheet of booking rows. The program is
 ### Schedule workbook (output)
 - If the file **does not exist**, it will be created.
 - If the file **already exists**, it will be updated in place (existing sheets reused).
-
----
-
-## Command-line usage (optional)
-
-If you prefer CLI (or want to automate):
-
-```bat
-scheduler.exe "Bookings.xlsx" "Schedule.xlsx"
-```
-
-Same arguments as the UI.
 
 ---
 
