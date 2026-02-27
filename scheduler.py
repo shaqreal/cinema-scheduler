@@ -1720,34 +1720,197 @@ def find_date_row(ws: Worksheet, target_date: datetime, start_row: int = 3) -> O
 def ensure_week_rows(ws: Worksheet, play_week: datetime, start_row: int = 3) -> Tuple[int, int]:
     """
     Ensure the worksheet has rows for the play week date and its FSS row.
-    
-    Weeks are written starting at start_row (default 3, after headers in rows 1-2).
+
+    Planner detection is limited to column A date rows in the planner section only.
+    The planner section starts at the first date in column A and ends at the first
+    clear break (2+ blank rows or a non-date/non-blank marker row).
 
     Returns a tuple of (titles_row_index, fss_row_index).
     """
-    date_row = find_date_row(ws, play_week, start_row=start_row)
-    if date_row is None:
-        # Append after the last existing row, but ensure we start at least at start_row
-        if ws.max_row < start_row:
-            date_row = start_row
-        else:
-            date_row = ws.max_row + 1
-        date_cell = ws.cell(row=date_row, column=1, value=play_week)
-        date_cell.number_format = "m/d/yy"
-        date_cell.alignment = WRAP_TOP
-        # Ensure there's a row for FSS directly below.
-        fss_row = date_row + 1
-        ws.cell(row=fss_row, column=1, value=None)
-    else:
-        fss_row = date_row + 1
+    def _parse_week_date(value: object) -> Optional[date]:
+        """Parse Excel/Python/string date-like values into a python date."""
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return None
+            parsed = pd.to_datetime(raw, errors="coerce")
+            if pd.notna(parsed):
+                return parsed.date()
+        return None
 
-    # Ensure consistent date formatting/alignment for the week row
+    def _planner_last_col() -> int:
+        """
+        Detect planner width so insertion/shift touches planner columns only.
+
+        Preference:
+          1) Thick right border divider on planner rows.
+          2) Last non-empty row-2 header.
+          3) Fallback to column A.
+        """
+        probe_row = max(start_row, 1)
+        for c in range(2, ws.max_column + 1):
+            if ws.cell(row=probe_row, column=c).border.right.style == "thick":
+                return c
+
+        last_header_col = 1
+        for c in range(1, ws.max_column + 1):
+            if ws.cell(row=2, column=c).value not in (None, ""):
+                last_header_col = c
+        return max(1, last_header_col)
+
+    def _copy_planner_cell(src_row: int, dst_row: int, col: int) -> None:
+        """Copy value + style metadata for a planner cell during row shifting."""
+        src = ws.cell(row=src_row, column=col)
+        dst = ws.cell(row=dst_row, column=col)
+        dst._value = src._value
+        dst.data_type = src.data_type
+        dst._style = src._style
+        dst.number_format = src.number_format
+        dst.font = src.font
+        dst.fill = src.fill
+        dst.border = src.border
+        dst.alignment = src.alignment
+        dst.protection = src.protection
+        dst.hyperlink = src.hyperlink
+        dst.comment = src.comment
+
+    def _clear_planner_cell(row: int, col: int) -> None:
+        """Clear planner cell content after creating insertion space."""
+        cell = ws.cell(row=row, column=col)
+        cell.value = None
+        cell.hyperlink = None
+        cell.comment = None
+
+    def _copy_row_style(template_row: int, target_row: int, col_start: int, col_end: int) -> None:
+        """Copy style-only attributes from template row to new row in planner columns."""
+        for col in range(col_start, col_end + 1):
+            src = ws.cell(row=template_row, column=col)
+            dst = ws.cell(row=target_row, column=col)
+            dst._style = src._style
+            dst.number_format = src.number_format
+            dst.font = src.font
+            dst.fill = src.fill
+            dst.border = src.border
+            dst.alignment = src.alignment
+            dst.protection = src.protection
+
+    def _collect_planner_date_rows() -> List[Tuple[int, date]]:
+        """
+        Collect planner date rows from column A only.
+
+        Rules:
+          - Planner starts at first valid date in column A at/after start_row.
+          - After start, stop at first clear break:
+              * 2+ consecutive blank rows in column A, or
+              * a non-blank/non-date marker row.
+          - Ignore non-date rows before planner start.
+        """
+        first_date_row: Optional[int] = None
+        for r in range(start_row, ws.max_row + 1):
+            if _parse_week_date(ws.cell(row=r, column=1).value) is not None:
+                first_date_row = r
+                break
+
+        if first_date_row is None:
+            return []
+
+        planner_rows: List[Tuple[int, date]] = []
+        blank_streak = 0
+        for r in range(first_date_row, ws.max_row + 1):
+            value = ws.cell(row=r, column=1).value
+            parsed = _parse_week_date(value)
+
+            if parsed is not None:
+                planner_rows.append((r, parsed))
+                blank_streak = 0
+                continue
+
+            if value is None or (isinstance(value, str) and value.strip() == ""):
+                blank_streak += 1
+                if blank_streak >= 2:
+                    break
+                continue
+
+            # Non-blank/non-date content indicates we left planner body.
+            break
+
+        return planner_rows
+
+    target_date = play_week.date()
+    planner_last_col = _planner_last_col()
+    planner_rows = _collect_planner_date_rows()
+
+    # Reuse existing week row if present.
+    for row_idx, dt in planner_rows:
+        if dt == target_date:
+            date_row = row_idx
+            fss_row = date_row + 1
+            break
+    else:
+        sorted_by_date = sorted(planner_rows, key=lambda item: item[1])
+
+        if not sorted_by_date:
+            # Empty planner: start at planner origin.
+            date_row = start_row
+            planner_bottom_row = start_row - 1
+        else:
+            # Insert before earliest greater date, otherwise after last planner week block.
+            insertion_target: Optional[int] = None
+            for row_idx, dt in sorted_by_date:
+                if target_date < dt:
+                    insertion_target = row_idx
+                    break
+
+            if insertion_target is not None:
+                date_row = insertion_target
+            else:
+                last_date_row = max(r for r, _ in planner_rows)
+                date_row = last_date_row + 2
+
+            planner_bottom_row = max(r + 1 for r, _ in planner_rows)
+
+        # Shift planner area downward by 2 rows only when inserting inside existing planner range.
+        if planner_bottom_row >= date_row:
+            for r in range(planner_bottom_row, date_row - 1, -1):
+                for c in range(1, planner_last_col + 1):
+                    _copy_planner_cell(r, r + 2, c)
+
+            # Clear the newly inserted two-row planner block.
+            for r in (date_row, date_row + 1):
+                for c in range(1, planner_last_col + 1):
+                    _clear_planner_cell(r, c)
+
+        # Preserve inserted row formatting from nearest week block above, else below.
+        if planner_rows:
+            if date_row - 2 >= start_row:
+                template_date_row = date_row - 2
+                template_fss_row = date_row - 1
+            else:
+                template_date_row = date_row + 2
+                template_fss_row = date_row + 3
+
+            _copy_row_style(template_date_row, date_row, 1, planner_last_col)
+            _copy_row_style(template_fss_row, date_row + 1, 1, planner_last_col)
+
+            ws.row_dimensions[date_row].height = ws.row_dimensions[template_date_row].height
+            ws.row_dimensions[date_row + 1].height = ws.row_dimensions[template_fss_row].height
+
+        fss_row = date_row + 1
+        ws.cell(row=date_row, column=1, value=play_week)
+        ws.cell(row=fss_row, column=1, value=None)
+
+    # Keep date cell formatting consistent.
     date_cell = ws.cell(row=date_row, column=1)
     date_cell.number_format = "m/d/yy"
     date_cell.alignment = WRAP_TOP
 
     return date_row, fss_row
-
 
 def format_title_line(row: pd.Series) -> str:
     """Create the display string for a movie title line."""
