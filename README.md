@@ -53,7 +53,6 @@ An Excel file (`.xlsx` / `.xlsm`) with one sheet of booking rows. The program is
 This happens when the UI is accidentally launching itself instead of the scheduler.
 
 Fix:
-- Make sure you have **both** `scheduler.exe` **and** `scheduler_ui.exe` in the same folder.
 - Do not rename `scheduler_ui.exe` to `scheduler.exe`.
 
 ### “File is open” / permission errors
